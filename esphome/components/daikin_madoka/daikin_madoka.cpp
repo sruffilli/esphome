@@ -30,6 +30,11 @@ static constexpr std::array<ClimateMode, 5> DEVICE_MODES{CLIMATE_MODE_FAN_ONLY, 
 static constexpr uint8_t DEVICE_MODE_HEAT = 4;
 // Publishes the parsed state when the poll's last reply, SENSOR_INFORMATION, does not arrive
 static constexpr uint32_t PUBLISH_DELAY_MS = 800;
+// A GET waits for its reply before the next command goes out: the Madoka cannot take overlapping
+// requests, and answers them with merged or duplicated replies while dropping others.
+// REPLY_TIMEOUT_MS bounds the wait when a reply is lost; REPLY_GAP_MS spaces the next command.
+static constexpr uint32_t REPLY_TIMEOUT_MS = 1000;
+static constexpr uint32_t REPLY_GAP_MS = 20;
 // Consecutive failed writes that end the connection instead of retrying forever
 static constexpr uint8_t MAX_WRITE_FAILURES = 5;
 // Back-off after repeated authentication failures: the first failure retries at once, the next ones
@@ -279,9 +284,17 @@ void DaikinMadoka::update() {
 
 void DaikinMadoka::process_incoming_chunk_(std::span<const uint8_t> chunk) {
   switch (this->assembler_.feed(chunk)) {
-    case ChunkResult::CHUNK_RESULT_COMPLETE:
-      this->parse_cb_(this->assembler_.message());
+    case ChunkResult::CHUNK_RESULT_COMPLETE: {
+      const auto msg = this->assembler_.message();
+      this->parse_cb_(msg);
+      // A late reply to an earlier GET must not release the one in flight
+      if (this->get_in_flight_ && is_valid_message(msg) && message_function_id(msg) == this->in_flight_cmd_) {
+        // The reply is in: send the next command now instead of waiting out the reply timeout
+        this->get_in_flight_ = false;
+        this->set_timeout(QUERY_TIMEOUT_ID, REPLY_GAP_MS, [this]() { this->send_next_query_(); });
+      }
       break;
+    }
     case ChunkResult::CHUNK_RESULT_INVALID_LENGTH:
       ESP_LOGW(TAG, "Chunk discarded: invalid length");
       break;
@@ -356,6 +369,7 @@ void DaikinMadoka::send_next_query_() {
   if (this->write_query_(query)) {
     this->query_queue_.pop();
     this->get_in_flight_ = !is_set;
+    this->in_flight_cmd_ = cmd;
     this->write_failures_ = 0;
   } else if (++this->write_failures_ >= MAX_WRITE_FAILURES) {
     // The disconnect event clears the queue and the pacing state
@@ -363,7 +377,8 @@ void DaikinMadoka::send_next_query_() {
     return;
   }
   this->query_cooldown_ = true;
-  this->set_timeout(QUERY_TIMEOUT_ID, get_command_cooldown(cmd), [this]() { this->send_next_query_(); });
+  const uint32_t wait = this->get_in_flight_ ? REPLY_TIMEOUT_MS : get_command_cooldown(cmd);
+  this->set_timeout(QUERY_TIMEOUT_ID, wait, [this]() { this->send_next_query_(); });
 }
 
 bool DaikinMadoka::write_query_(const Query &query) {

@@ -97,6 +97,8 @@ class DaikinMadoka final : public climate::Climate, public esphome::ble_client::
   bool poll_pending_{false};
   // The last command written was a GET, so its reply may still be arriving
   bool get_in_flight_{false};
+  // Command id of the last GET written, matched against the reply that releases the next command
+  uint16_t in_flight_cmd_{0};
   // Consecutive failed writes on this connection; too many end the connection
   uint8_t write_failures_{0};
   // Consecutive failed authentications; reset once a connection is established
