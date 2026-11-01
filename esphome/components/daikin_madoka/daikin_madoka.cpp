@@ -401,6 +401,15 @@ void DaikinMadoka::parse_cb_(std::span<const uint8_t> msg) {
     ESP_LOGW(TAG, "Discarding message: invalid length");
     return;
   }
+#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG
+  {
+    // Raw replies, to tell a missing argument from a parsing bug; long replies are cut at 64 bytes
+    static constexpr size_t MAX_LOGGED_BYTES = 64;
+    char hex[format_hex_pretty_size(MAX_LOGGED_BYTES)];
+    ESP_LOGD(TAG, "[%s] Reply 0x%04X: %s", this->parent_->address_str(), message_function_id(msg),
+             format_hex_pretty_to(hex, sizeof(hex), msg.data(), std::min(msg.size(), MAX_LOGGED_BYTES)));
+  }
+#endif
 
   switch (message_function_id(msg)) {
     case CMD_GET_SETTING_STATUS: {
