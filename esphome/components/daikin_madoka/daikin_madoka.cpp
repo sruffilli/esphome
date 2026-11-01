@@ -247,6 +247,10 @@ void DaikinMadoka::process_incoming_chunk_(std::span<const uint8_t> chunk) {
     case ChunkResult::CHUNK_RESULT_INVALID_ID:
       ESP_LOGW(TAG, "Chunk discarded: invalid chunk id %u", chunk[0]);
       break;
+    case ChunkResult::CHUNK_RESULT_OUT_OF_SEQUENCE:
+      // A chunk was lost, so the message in progress is dropped; the reply timeout recovers
+      ESP_LOGD(TAG, "Chunk %u out of sequence, message dropped", chunk[0]);
+      break;
     case ChunkResult::CHUNK_RESULT_TOO_LONG:
       ESP_LOGW(TAG, "Message discarded: too long");
       break;
