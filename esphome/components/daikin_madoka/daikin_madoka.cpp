@@ -28,8 +28,14 @@ static constexpr uint16_t CMD_SET_FLAG = 0x4000;
 static constexpr std::array<ClimateMode, 5> DEVICE_MODES{CLIMATE_MODE_FAN_ONLY, CLIMATE_MODE_DRY,
                                                          CLIMATE_MODE_HEAT_COOL, CLIMATE_MODE_COOL, CLIMATE_MODE_HEAT};
 static constexpr uint8_t DEVICE_MODE_HEAT = 4;
-// Publishes the parsed state when the poll's last reply, SENSOR_INFORMATION, does not arrive
-static constexpr uint32_t PUBLISH_DELAY_MS = 800;
+// Publishes the parsed state when the poll's last reply, SENSOR_INFORMATION, does not arrive.
+// Longer than REPLY_TIMEOUT_MS, so a lost reply mid-poll does not publish a half-read state.
+static constexpr uint32_t PUBLISH_DELAY_MS = 1500;
+// A GET waits for its reply before the next command goes out: the Madoka cannot take overlapping
+// requests, and answers them with merged or duplicated replies while dropping others.
+// REPLY_TIMEOUT_MS bounds the wait when a reply is lost; REPLY_GAP_MS spaces the next command.
+static constexpr uint32_t REPLY_TIMEOUT_MS = 1000;
+static constexpr uint32_t REPLY_GAP_MS = 20;
 
 void DaikinMadoka::dump_config() { LOG_CLIMATE(TAG, "Daikin Madoka Climate Controller", this); }
 
@@ -238,9 +244,17 @@ void DaikinMadoka::update() {
 
 void DaikinMadoka::process_incoming_chunk_(std::span<const uint8_t> chunk) {
   switch (this->assembler_.feed(chunk)) {
-    case ChunkResult::CHUNK_RESULT_COMPLETE:
-      this->parse_cb_(this->assembler_.message());
+    case ChunkResult::CHUNK_RESULT_COMPLETE: {
+      const auto msg = this->assembler_.message();
+      this->parse_cb_(msg);
+      // A late reply to an earlier GET must not release the one in flight
+      if (this->get_in_flight_ && is_valid_message(msg) && message_function_id(msg) == this->in_flight_cmd_) {
+        // The reply is in: send the next command now instead of waiting out the reply timeout
+        this->get_in_flight_ = false;
+        this->set_timeout(QUERY_TIMEOUT_ID, REPLY_GAP_MS, [this]() { this->send_next_query_(); });
+      }
       break;
+    }
     case ChunkResult::CHUNK_RESULT_INVALID_LENGTH:
       ESP_LOGW(TAG, "Chunk discarded: invalid length");
       break;
@@ -297,14 +311,17 @@ void DaikinMadoka::send_next_query_() {
     this->get_in_flight_ = false;
     return;
   }
+  // Reached after the previous reply or its timeout; a GET still marked in flight lost its reply
+  if (this->get_in_flight_) {
+    ESP_LOGD(TAG, "[%s] No reply to 0x%04X", this->parent_->address_str(), this->in_flight_cmd_);
+    this->get_in_flight_ = false;
+  }
   if (this->query_queue_.empty()) {
     if (!this->poll_pending_) {
       this->query_cooldown_ = false;
       return;
     }
     this->poll_pending_ = false;
-    // Chunks left from a partly lost reply must not combine with this batch's replies
-    this->assembler_.reset();
     for (auto cmd : POLL_CMDS) {
       this->enqueue_query_(cmd, NO_ARGS);
     }
@@ -312,16 +329,19 @@ void DaikinMadoka::send_next_query_() {
   const Query &query = this->query_queue_.front();
   const uint16_t cmd = query.cmd;
   const bool is_set = (cmd & CMD_SET_FLAG) != 0;
-  // A GET's reply may still be arriving when the next command goes out, so a SET resets only when none is
-  if (is_set && !this->get_in_flight_)
-    this->assembler_.reset();
+  // No reply is awaited now, so chunks still held belong to a lost or late reply
+  this->assembler_.reset();
   // On a failed write the query stays queued for the next pass
   if (this->write_query_(query)) {
     this->query_queue_.pop();
-    this->get_in_flight_ = !is_set;
+    if (!is_set) {
+      this->get_in_flight_ = true;
+      this->in_flight_cmd_ = cmd;
+    }
   }
   this->query_cooldown_ = true;
-  this->set_timeout(QUERY_TIMEOUT_ID, get_command_cooldown(cmd), [this]() { this->send_next_query_(); });
+  const uint32_t wait = this->get_in_flight_ ? REPLY_TIMEOUT_MS : get_command_cooldown(cmd);
+  this->set_timeout(QUERY_TIMEOUT_ID, wait, [this]() { this->send_next_query_(); });
 }
 
 bool DaikinMadoka::write_query_(const Query &query) {

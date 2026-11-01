@@ -89,8 +89,10 @@ class DaikinMadoka final : public climate::Climate, public esphome::ble_client::
   bool query_cooldown_{false};
   // A poll waits for the queue to drain, so it runs after any SET command ahead of it
   bool poll_pending_{false};
-  // The last command written was a GET, so its reply may still be arriving
+  // A GET was written and its reply has neither arrived nor timed out
   bool get_in_flight_{false};
+  // Command id of the last GET written, matched against the reply that releases the next command
+  uint16_t in_flight_cmd_{0};
 
   static constexpr uint32_t QUERY_TIMEOUT_ID = 0;
   static constexpr uint32_t PUBLISH_TIMEOUT_ID = 1;
