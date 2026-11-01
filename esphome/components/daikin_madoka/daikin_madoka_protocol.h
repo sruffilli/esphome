@@ -37,9 +37,11 @@ enum class ChunkResult : uint8_t {
   CHUNK_RESULT_TOO_LONG,
 };
 
-/// Reassembles notifications (one chunk id byte followed by payload) into a message. Chunks may
-/// arrive in any order: each is kept in the slot of its id, and the message is complete once chunk 0
-/// is in and the chunks from 0 on add up to its length byte.
+/// Reassembles notifications (one chunk id byte followed by payload) into a message.
+/// Notifications on one ATT bearer are delivered in order, so chunks are taken strictly in sequence:
+/// chunk 0 always starts a new message, and any other chunk is accepted only when it is the next one
+/// expected. A chunk left over from a reply whose chunk 0 was lost is therefore dropped instead of
+/// being combined with the next reply.
 /// After CHUNK_RESULT_COMPLETE, message() holds the message until reset() or the next feed().
 class MessageAssembler {
  public:
@@ -52,32 +54,28 @@ class MessageAssembler {
     const auto payload = chunk.subspan(1);
     if (chunk_id >= MAX_CHUNKS)
       return ChunkResult::CHUNK_RESULT_INVALID_ID;
+    if (chunk_id == 0) {
+      this->reset();
+    } else if (chunk_id != this->next_chunk_id_) {
+      // Out of sequence: a leftover of an earlier reply, or this message lost a chunk
+      this->reset();
+      return ChunkResult::CHUNK_RESULT_INVALID_ID;
+    }
     if (payload.size() > MAX_CHUNK_PAYLOAD) {
       this->reset();
       return ChunkResult::CHUNK_RESULT_TOO_LONG;
     }
-    std::copy(payload.begin(), payload.end(), this->data_.begin() + chunk_id * MAX_CHUNK_PAYLOAD);
-    this->chunk_sizes_[chunk_id] = payload.size();
-    if (this->chunk_sizes_[0] == 0)
-      return ChunkResult::CHUNK_RESULT_PARTIAL;
+    std::copy(payload.begin(), payload.end(), this->data_.begin() + this->received_);
+    this->received_ += payload.size();
+    this->next_chunk_id_ = chunk_id + 1;
 
     const uint8_t length = this->data_[0];
-    size_t total = this->chunk_sizes_[0];
-    uint8_t count = 1;
-    while (total < length && count < MAX_CHUNKS && this->chunk_sizes_[count] != 0)
-      total += this->chunk_sizes_[count++];
-    if (total > length) {
+    if (this->received_ > length) {
       this->reset();
       return ChunkResult::CHUNK_RESULT_TOO_LONG;
     }
-    if (total < length)
+    if (this->received_ < length)
       return ChunkResult::CHUNK_RESULT_PARTIAL;
-    // Close the gaps left by short chunks; each one only moves towards the start
-    size_t pos = this->chunk_sizes_[0];
-    for (uint8_t i = 1; i < count; i++) {
-      std::copy_n(this->data_.begin() + i * MAX_CHUNK_PAYLOAD, this->chunk_sizes_[i], this->data_.begin() + pos);
-      pos += this->chunk_sizes_[i];
-    }
     this->message_size_ = length;
     return ChunkResult::CHUNK_RESULT_COMPLETE;
   }
@@ -85,14 +83,17 @@ class MessageAssembler {
   std::span<const uint8_t> message() const { return {this->data_.data(), this->message_size_}; }
 
   void reset() {
-    this->chunk_sizes_.fill(0);
+    this->received_ = 0;
+    this->next_chunk_id_ = 0;
     this->message_size_ = 0;
   }
 
  protected:
   std::array<uint8_t, MAX_CHUNKS * MAX_CHUNK_PAYLOAD> data_;
-  // Payload bytes held for each chunk id, 0 while that chunk is missing
-  std::array<uint8_t, MAX_CHUNKS> chunk_sizes_{};
+  // Message bytes received so far, in order
+  uint16_t received_{0};
+  // The chunk id that may continue the message; 0 while no message is in progress
+  uint8_t next_chunk_id_{0};
   uint8_t message_size_{0};
 };
 
