@@ -30,6 +30,8 @@ static const espbt::ESPBTUUID NOTIFY_CHARACTERISTIC_UUID =
 static const espbt::ESPBTUUID WWR_CHARACTERISTIC_UUID =
     espbt::ESPBTUUID::from_raw("2141e112-213a-11e6-b67b-9e71128cae77");
 
+static constexpr uint8_t DEVICE_MODE_UNKNOWN = 0xFF;
+
 struct Query {
   uint16_t cmd;
   QueryArgs args;
@@ -80,12 +82,14 @@ class DaikinMadoka final : public climate::Climate, public esphome::ble_client::
   void parse_cb_(std::span<const uint8_t> msg);
   void update_mode_from_status_();
   void fail_connection_(const LogString *reason);
+  void handle_auth_failure_(uint8_t reason);
 
   StaticRingBuffer<Query, QUERY_QUEUE_SIZE> query_queue_;
   MessageAssembler assembler_;
   uint16_t notify_handle_{0};
   uint16_t wwr_handle_{0};
-  uint8_t device_mode_{0};
+  // DEVICE_MODE_UNKNOWN until an operation mode reply arrives on the current connection
+  uint8_t device_mode_{DEVICE_MODE_UNKNOWN};
   bool power_on_{false};
   // True while the query timeout is armed to pace the next send
   bool query_cooldown_{false};
@@ -93,9 +97,14 @@ class DaikinMadoka final : public climate::Climate, public esphome::ble_client::
   bool poll_pending_{false};
   // The last command written was a GET, so its reply may still be arriving
   bool get_in_flight_{false};
+  // Consecutive failed writes on this connection; too many end the connection
+  uint8_t write_failures_{0};
+  // Consecutive failed authentications; reset once a connection is established
+  uint8_t auth_failures_{0};
 
   static constexpr uint32_t QUERY_TIMEOUT_ID = 0;
   static constexpr uint32_t PUBLISH_TIMEOUT_ID = 1;
+  static constexpr uint32_t AUTH_BACKOFF_TIMEOUT_ID = 2;
 };
 
 }  // namespace esphome::daikin_madoka

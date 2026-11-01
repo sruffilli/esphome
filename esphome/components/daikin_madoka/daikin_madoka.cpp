@@ -30,6 +30,15 @@ static constexpr std::array<ClimateMode, 5> DEVICE_MODES{CLIMATE_MODE_FAN_ONLY, 
 static constexpr uint8_t DEVICE_MODE_HEAT = 4;
 // Publishes the parsed state when the poll's last reply, SENSOR_INFORMATION, does not arrive
 static constexpr uint32_t PUBLISH_DELAY_MS = 800;
+// Consecutive failed writes that end the connection instead of retrying forever
+static constexpr uint8_t MAX_WRITE_FAILURES = 5;
+// Back-off after repeated authentication failures: the first failure retries at once, the next ones
+// wait AUTH_BACKOFF_BASE_MS doubled per failure, capped at AUTH_BACKOFF_MAX_MS. Hammering a
+// thermostat with failing pairings is what leaves its Bluetooth stack refusing every attempt.
+static constexpr uint32_t AUTH_BACKOFF_BASE_MS = 30 * 1000;
+static constexpr uint32_t AUTH_BACKOFF_MAX_MS = 15 * 60 * 1000;
+// From this many consecutive failures on, the log asks for a re-pair
+static constexpr uint8_t AUTH_FAILURES_BEFORE_ERROR = 3;
 
 void DaikinMadoka::dump_config() { LOG_CLIMATE(TAG, "Daikin Madoka Climate Controller", this); }
 
@@ -61,7 +70,8 @@ static uint32_t get_command_cooldown(uint16_t cmd) {
 
 void DaikinMadoka::control(const ClimateCall &call) {
   if (this->node_state != espbt::ClientState::ESTABLISHED) {
-    this->publish_state();  // Update state to reflect that the device is disconnected
+    ESP_LOGW(TAG, "[%s] Not connected, command ignored", this->parent_->address_str());
+    this->publish_state();  // Reverts the frontend's optimistic state to the last known one
     return;
   }
 
@@ -127,6 +137,29 @@ void DaikinMadoka::fail_connection_(const LogString *reason) {
   this->parent_->disconnect();
 }
 
+void DaikinMadoka::handle_auth_failure_(uint8_t reason) {
+  if (this->auth_failures_ < UINT8_MAX)
+    this->auth_failures_++;
+  // reason is an esp_ble_auth_fail_rsn_t / ESP_AUTH_SMP_* value; 81 is CONFIRM_VALUE_FAIL
+  if (this->auth_failures_ >= AUTH_FAILURES_BEFORE_ERROR) {
+    ESP_LOGE(TAG,
+             "[%s] Authentication failed %u times in a row, reason %u (0x%02X). If the bond is gone or "
+             "stale, remove it and pair again at the thermostat",
+             this->parent_->address_str(), this->auth_failures_, reason, reason);
+  } else {
+    ESP_LOGW(TAG, "[%s] Authentication failed, reason %u (0x%02X)", this->parent_->address_str(), reason, reason);
+  }
+  this->fail_connection_(LOG_STR("Pairing failed"));
+  if (this->auth_failures_ < 2)
+    return;
+  const uint8_t shift = std::min<uint8_t>(this->auth_failures_ - 2, 5);
+  const uint32_t backoff = std::min(AUTH_BACKOFF_BASE_MS << shift, AUTH_BACKOFF_MAX_MS);
+  ESP_LOGW(TAG, "[%s] Next connection attempt in %" PRIu32 " s", this->parent_->address_str(), backoff / 1000);
+  // Disabling the client also stops it from reconnecting on the next advertisement
+  this->parent()->set_enabled(false);
+  this->set_timeout(AUTH_BACKOFF_TIMEOUT_ID, backoff, [this]() { this->parent()->set_enabled(true); });
+}
+
 void DaikinMadoka::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
   switch (event) {
     case ESP_GAP_BLE_NC_REQ_EVT:
@@ -140,8 +173,13 @@ void DaikinMadoka::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_c
       if (!this->parent()->check_addr(param->ble_security.auth_cmpl.bd_addr))
         return;
       if (!param->ble_security.auth_cmpl.success) {
-        ESP_LOGW(TAG, "Authentication failed, reason: 0x%x", param->ble_security.auth_cmpl.fail_reason);
-        this->fail_connection_(LOG_STR("Pairing failed"));
+        this->handle_auth_failure_(param->ble_security.auth_cmpl.fail_reason);
+        break;
+      }
+      // A later re-encryption on a working link must not redo the setup: the client has released the
+      // service table by then, so the characteristic lookup would fail and drop a healthy connection
+      if (this->node_state == espbt::ClientState::ESTABLISHED || this->notify_handle_ != 0) {
+        ESP_LOGD(TAG, "[%s] Authentication completed again on an open link", this->parent_->address_str());
         break;
       }
       auto *nfy = this->parent_->get_characteristic(MADOKA_SERVICE_UUID, NOTIFY_CHARACTERISTIC_UUID);
@@ -170,11 +208,12 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       this->notify_handle_ = 0;
       this->wwr_handle_ = 0;
 
+      // Keep the last known mode, setpoints and fan speed: publishing OFF here would look like a real
+      // power-off to Home Assistant on every link drop. The missing room temperature marks the state
+      // as stale, and the warning status flags the component until the link is back.
       this->current_temperature = NAN;
-      this->target_temperature_high = NAN;
-      this->target_temperature_low = NAN;
-      this->mode = climate::CLIMATE_MODE_OFF;
-      this->fan_mode.reset();
+      this->device_mode_ = DEVICE_MODE_UNKNOWN;
+      this->status_set_warning(LOG_STR("Disconnected"));
       this->publish_state();
 
       this->assembler_.reset();
@@ -184,6 +223,7 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       this->query_queue_.clear();
       this->poll_pending_ = false;
       this->get_in_flight_ = false;
+      this->write_failures_ = 0;
       break;
     }
     case ESP_GATTC_WRITE_DESCR_EVT:
@@ -208,6 +248,7 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
         break;
       }
       this->node_state = espbt::ClientState::ESTABLISHED;
+      this->auth_failures_ = 0;
       this->status_clear_warning();
       this->update();
       break;
@@ -315,6 +356,11 @@ void DaikinMadoka::send_next_query_() {
   if (this->write_query_(query)) {
     this->query_queue_.pop();
     this->get_in_flight_ = !is_set;
+    this->write_failures_ = 0;
+  } else if (++this->write_failures_ >= MAX_WRITE_FAILURES) {
+    // The disconnect event clears the queue and the pacing state
+    this->fail_connection_(LOG_STR("Writes keep failing"));
+    return;
   }
   this->query_cooldown_ = true;
   this->set_timeout(QUERY_TIMEOUT_ID, get_command_cooldown(cmd), [this]() { this->send_next_query_(); });
@@ -381,7 +427,10 @@ void DaikinMadoka::parse_cb_(std::span<const uint8_t> msg) {
       break;
     }
     case CMD_GET_FAN_SPEED: {
-      // Heat mode uses the heating fan speed (0x21); the other modes use the cooling one (0x20)
+      // Heat mode uses the heating fan speed (0x21); the other modes use the cooling one (0x20).
+      // Without a mode reply the slot is unknown, so the fan speed is left as it was.
+      if (this->device_mode_ == DEVICE_MODE_UNKNOWN)
+        break;
       auto value = find_arg(msg, this->device_mode_ == DEVICE_MODE_HEAT ? 0x21 : 0x20);
       if (value.size() != 1) {
         break;
