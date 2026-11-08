@@ -7,6 +7,11 @@
 
 #ifdef USE_ESP32
 
+// Hardware test build only, not for upstream: ESPHome 2026.10 has no ESP_LOGV_HEX
+#ifndef ESP_LOGV_HEX
+#define ESP_LOGV_HEX(...)
+#endif
+
 namespace esphome::daikin_madoka {
 
 using namespace esphome::climate;
