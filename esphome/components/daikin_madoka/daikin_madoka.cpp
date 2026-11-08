@@ -7,6 +7,11 @@
 
 #ifdef USE_ESP32
 
+// ESPHome 2026.10 has no ESP_LOGV_HEX; drop this once the add-on runs 2026.11
+#ifndef ESP_LOGV_HEX
+#define ESP_LOGV_HEX(...)
+#endif
+
 namespace esphome::daikin_madoka {
 
 using namespace esphome::climate;
