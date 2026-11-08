@@ -67,7 +67,8 @@ static uint32_t get_command_cooldown(uint16_t cmd) {
 
 void DaikinMadoka::control(const ClimateCall &call) {
   if (this->node_state != espbt::ClientState::ESTABLISHED) {
-    this->publish_state();  // Update state to reflect that the device is disconnected
+    ESP_LOGW(TAG, "[%s] Not connected, command ignored", this->parent_->address_str());
+    this->publish_if_mode_read_();  // Reverts the frontend's optimistic state to the last known one
     return;
   }
 
@@ -176,12 +177,19 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       this->notify_handle_ = 0;
       this->wwr_handle_ = 0;
 
+      // The temperatures and fan speed go unknown, but the mode stays: a climate has no unknown mode,
+      // and publishing OFF would look like a real power-off to Home Assistant on every link drop.
+      // The warning status flags the component until the link is back.
       this->current_temperature = NAN;
       this->target_temperature_high = NAN;
       this->target_temperature_low = NAN;
-      this->mode = climate::CLIMATE_MODE_OFF;
       this->fan_mode.reset();
-      this->publish_state();
+      this->device_mode_ = DEVICE_MODE_UNKNOWN;
+      this->power_known_ = false;
+      this->status_set_warning(LOG_STR("Disconnected"));
+      // Before the first read the mode is only the OFF default, so nothing is published yet
+      if (this->has_state())
+        this->publish_state();
 
       this->assembler_.reset();
       this->cancel_timeout(QUERY_TIMEOUT_ID);
@@ -371,11 +379,20 @@ bool DaikinMadoka::write_query_(const Query &query) {
 }
 
 void DaikinMadoka::update_mode_from_status_() {
+  if (!this->power_known_)
+    return;
   if (!this->power_on_) {
     this->mode = CLIMATE_MODE_OFF;
   } else if (this->device_mode_ < DEVICE_MODES.size()) {
     this->mode = DEVICE_MODES[this->device_mode_];
   }
+}
+
+void DaikinMadoka::publish_if_mode_read_() {
+  // The first publish waits for a real mode: the climate's default is OFF, which would read as a power-off
+  const bool mode_read = this->power_known_ && (!this->power_on_ || this->device_mode_ < DEVICE_MODES.size());
+  if (mode_read || this->has_state())
+    this->publish_state();
 }
 
 void DaikinMadoka::parse_cb_(std::span<const uint8_t> msg) {
@@ -391,6 +408,7 @@ void DaikinMadoka::parse_cb_(std::span<const uint8_t> msg) {
     case CMD_GET_SETTING_STATUS: {
       if (auto value = find_arg(msg, 0x20); value.size() == 1) {
         this->power_on_ = value[0] == 1;
+        this->power_known_ = true;
         this->update_mode_from_status_();
       }
       break;
@@ -412,7 +430,10 @@ void DaikinMadoka::parse_cb_(std::span<const uint8_t> msg) {
       break;
     }
     case CMD_GET_FAN_SPEED: {
-      // Heat mode uses the heating fan speed (0x21); the other modes use the cooling one (0x20)
+      // Heat mode uses the heating fan speed (0x21); the other modes use the cooling one (0x20).
+      // Without a mode reply the slot is unknown, so the fan speed is left as it was.
+      if (this->device_mode_ == DEVICE_MODE_UNKNOWN)
+        break;
       auto value = find_arg(msg, this->device_mode_ == DEVICE_MODE_HEAT ? 0x21 : 0x20);
       if (value.size() != 1) {
         break;
@@ -442,13 +463,13 @@ void DaikinMadoka::parse_cb_(std::span<const uint8_t> msg) {
         this->current_temperature = static_cast<float>(value[0]);
       }
       this->cancel_timeout(PUBLISH_TIMEOUT_ID);
-      this->publish_state();
+      this->publish_if_mode_read_();
       return;
     }
     default:
       return;
   }
-  this->set_timeout(PUBLISH_TIMEOUT_ID, PUBLISH_DELAY_MS, [this]() { this->publish_state(); });
+  this->set_timeout(PUBLISH_TIMEOUT_ID, PUBLISH_DELAY_MS, [this]() { this->publish_if_mode_read_(); });
 }
 
 }  // namespace esphome::daikin_madoka
