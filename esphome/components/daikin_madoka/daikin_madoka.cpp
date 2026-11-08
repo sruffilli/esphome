@@ -36,6 +36,8 @@ static constexpr uint32_t PUBLISH_DELAY_MS = 1500;
 // REPLY_TIMEOUT_MS bounds the wait when a reply is lost; REPLY_GAP_MS spaces the next command.
 static constexpr uint32_t REPLY_TIMEOUT_MS = 1000;
 static constexpr uint32_t REPLY_GAP_MS = 20;
+// Consecutive failed writes that end the connection instead of retrying forever
+static constexpr uint8_t MAX_WRITE_FAILURES = 5;
 
 void DaikinMadoka::dump_config() { LOG_CLIMATE(TAG, "Daikin Madoka Climate Controller", this); }
 
@@ -146,8 +148,16 @@ void DaikinMadoka::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_c
       if (!this->parent()->check_addr(param->ble_security.auth_cmpl.bd_addr))
         return;
       if (!param->ble_security.auth_cmpl.success) {
-        ESP_LOGW(TAG, "Authentication failed, reason: 0x%x", param->ble_security.auth_cmpl.fail_reason);
+        // An esp_ble_auth_fail_rsn_t value, e.g. 81 (0x51) is ESP_AUTH_SMP_CONFIRM_VALUE_FAIL
+        ESP_LOGW(TAG, "[%s] Authentication failed, reason %u (0x%02X)", this->parent_->address_str(),
+                 param->ble_security.auth_cmpl.fail_reason, param->ble_security.auth_cmpl.fail_reason);
         this->fail_connection_(LOG_STR("Pairing failed"));
+        break;
+      }
+      // A later re-encryption on a working link must not redo the setup: the client has released the
+      // service table by then, so the characteristic lookup would fail and drop a healthy connection
+      if (this->node_state == espbt::ClientState::ESTABLISHED) {
+        ESP_LOGD(TAG, "[%s] Authentication completed again on an open link", this->parent_->address_str());
         break;
       }
       auto *nfy = this->parent_->get_characteristic(MADOKA_SERVICE_UUID, NOTIFY_CHARACTERISTIC_UUID);
@@ -184,12 +194,8 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       this->publish_state();
 
       this->assembler_.reset();
-      this->cancel_timeout(QUERY_TIMEOUT_ID);
       this->cancel_timeout(PUBLISH_TIMEOUT_ID);
-      this->query_cooldown_ = false;
-      this->query_queue_.clear();
-      this->poll_pending_ = false;
-      this->get_in_flight_ = false;
+      this->clear_queue_();
       break;
     }
     case ESP_GATTC_WRITE_DESCR_EVT:
@@ -200,6 +206,9 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       }
       break;
     case ESP_GATTC_SEARCH_CMPL_EVT: {
+      // A new connection: handles from one that ended without a disconnect event are stale
+      this->notify_handle_ = 0;
+      this->wwr_handle_ = 0;
       if (esp_ble_set_encryption(this->parent_->get_remote_bda(), ESP_BLE_SEC_ENCRYPT_MITM) != ESP_OK) {
         this->fail_connection_(LOG_STR("Encryption request failed"));
       }
@@ -302,13 +311,19 @@ void DaikinMadoka::enqueue_query_(uint16_t cmd, std::span<const uint8_t> args) {
   }
 }
 
+void DaikinMadoka::clear_queue_() {
+  this->cancel_timeout(QUERY_TIMEOUT_ID);
+  this->query_queue_.clear();
+  this->query_cooldown_ = false;
+  this->poll_pending_ = false;
+  this->get_in_flight_ = false;
+  this->write_failures_ = 0;
+}
+
 void DaikinMadoka::send_next_query_() {
   // BLE being disabled resets the client without a disconnect event, so the queue stops here
   if (this->node_state != espbt::ClientState::ESTABLISHED) {
-    this->query_queue_.clear();
-    this->query_cooldown_ = false;
-    this->poll_pending_ = false;
-    this->get_in_flight_ = false;
+    this->clear_queue_();
     return;
   }
   // Reached after the previous reply or its timeout; a GET still marked in flight lost its reply
@@ -338,6 +353,12 @@ void DaikinMadoka::send_next_query_() {
       this->get_in_flight_ = true;
       this->in_flight_cmd_ = cmd;
     }
+    this->write_failures_ = 0;
+  } else if (++this->write_failures_ >= MAX_WRITE_FAILURES) {
+    // The disconnect event may never come (BLE disabled, disconnect timeout), so stop the queue here
+    this->fail_connection_(LOG_STR("Writes keep failing"));
+    this->clear_queue_();
+    return;
   }
   this->query_cooldown_ = true;
   const uint32_t wait = this->get_in_flight_ ? REPLY_TIMEOUT_MS : get_command_cooldown(cmd);

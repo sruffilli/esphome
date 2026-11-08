@@ -78,6 +78,8 @@ class DaikinMadoka final : public climate::Climate, public esphome::ble_client::
   void parse_cb_(std::span<const uint8_t> msg);
   void update_mode_from_status_();
   void fail_connection_(const LogString *reason);
+  // Drops queued commands and the pacing state
+  void clear_queue_();
 
   StaticRingBuffer<Query, QUERY_QUEUE_SIZE> query_queue_;
   MessageAssembler assembler_;
@@ -93,6 +95,8 @@ class DaikinMadoka final : public climate::Climate, public esphome::ble_client::
   bool get_in_flight_{false};
   // Command id of the last GET written, matched against the reply that releases the next command
   uint16_t in_flight_cmd_{0};
+  // Consecutive failed writes on this connection; too many end the connection
+  uint8_t write_failures_{0};
 
   static constexpr uint32_t QUERY_TIMEOUT_ID = 0;
   static constexpr uint32_t PUBLISH_TIMEOUT_ID = 1;
