@@ -38,6 +38,12 @@ static constexpr uint32_t REPLY_TIMEOUT_MS = 1000;
 static constexpr uint32_t REPLY_GAP_MS = 20;
 // Consecutive failed writes that end the connection instead of retrying forever
 static constexpr uint8_t MAX_WRITE_FAILURES = 5;
+// After repeated authentication failures the client is disabled for AUTH_BACKOFF_BASE_MS, doubled per
+// failure up to AUTH_BACKOFF_MAX_MS: repeated failing pairings can leave the thermostat refusing them all
+static constexpr uint32_t AUTH_BACKOFF_BASE_MS = 30 * 1000;
+static constexpr uint32_t AUTH_BACKOFF_MAX_MS = 15 * 60 * 1000;
+// From this many consecutive failures on, the log asks for a re-pair
+static constexpr uint8_t AUTH_FAILURES_BEFORE_ERROR = 3;
 
 void DaikinMadoka::dump_config() { LOG_CLIMATE(TAG, "Daikin Madoka Climate Controller", this); }
 
@@ -136,6 +142,30 @@ void DaikinMadoka::fail_connection_(const LogString *reason) {
   this->parent_->disconnect();
 }
 
+void DaikinMadoka::handle_auth_failure_(uint8_t reason) {
+  if (this->auth_failures_ < UINT8_MAX)
+    this->auth_failures_++;
+  // An esp_ble_auth_fail_rsn_t value, e.g. 81 (0x51) is ESP_AUTH_SMP_CONFIRM_VALUE_FAIL
+  if (this->auth_failures_ >= AUTH_FAILURES_BEFORE_ERROR) {
+    ESP_LOGE(TAG,
+             "[%s] Authentication failed %u times in a row, reason %u (0x%02X). If the bond is gone or stale, "
+             "remove it and pair again at the thermostat",
+             this->parent_->address_str(), this->auth_failures_, reason, reason);
+  } else {
+    ESP_LOGW(TAG, "[%s] Authentication failed, reason %u (0x%02X)", this->parent_->address_str(), reason, reason);
+  }
+  this->fail_connection_(LOG_STR("Pairing failed"));
+  // The first failure retries at once; a restart of the node clears the count and the wait
+  if (this->auth_failures_ < 2)
+    return;
+  const uint8_t shift = std::min<uint8_t>(this->auth_failures_ - 2, 5);
+  const uint32_t backoff = std::min(AUTH_BACKOFF_BASE_MS << shift, AUTH_BACKOFF_MAX_MS);
+  ESP_LOGW(TAG, "[%s] Next connection attempt in %" PRIu32 " s", this->parent_->address_str(), backoff / 1000);
+  // A disabled client also ignores advertisements, so it does not reconnect before the wait ends
+  this->parent()->set_enabled(false);
+  this->set_timeout(AUTH_BACKOFF_TIMEOUT_ID, backoff, [this]() { this->parent()->set_enabled(true); });
+}
+
 void DaikinMadoka::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
   switch (event) {
     case ESP_GAP_BLE_NC_REQ_EVT:
@@ -149,10 +179,7 @@ void DaikinMadoka::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_c
       if (!this->parent()->check_addr(param->ble_security.auth_cmpl.bd_addr))
         return;
       if (!param->ble_security.auth_cmpl.success) {
-        // An esp_ble_auth_fail_rsn_t value, e.g. 81 (0x51) is ESP_AUTH_SMP_CONFIRM_VALUE_FAIL
-        ESP_LOGW(TAG, "[%s] Authentication failed, reason %u (0x%02X)", this->parent_->address_str(),
-                 param->ble_security.auth_cmpl.fail_reason, param->ble_security.auth_cmpl.fail_reason);
-        this->fail_connection_(LOG_STR("Pairing failed"));
+        this->handle_auth_failure_(param->ble_security.auth_cmpl.fail_reason);
         break;
       }
       // A later re-encryption on a working link must not redo the setup: the client has released the
@@ -231,6 +258,7 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
         break;
       }
       this->node_state = espbt::ClientState::ESTABLISHED;
+      this->auth_failures_ = 0;
       this->status_clear_warning();
       this->update();
       break;

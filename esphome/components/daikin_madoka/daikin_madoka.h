@@ -81,6 +81,7 @@ class DaikinMadoka final : public climate::Climate, public esphome::ble_client::
   void update_mode_from_status_();
   void publish_if_mode_read_();
   void fail_connection_(const LogString *reason);
+  void handle_auth_failure_(uint8_t reason);
   // Drops queued commands and the pacing state
   void clear_queue_();
 
@@ -103,9 +104,12 @@ class DaikinMadoka final : public climate::Climate, public esphome::ble_client::
   uint16_t in_flight_cmd_{0};
   // Consecutive failed writes on this connection; too many end the connection
   uint8_t write_failures_{0};
+  // Consecutive failed authentications; reset once a connection is established
+  uint8_t auth_failures_{0};
 
   static constexpr uint32_t QUERY_TIMEOUT_ID = 0;
   static constexpr uint32_t PUBLISH_TIMEOUT_ID = 1;
+  static constexpr uint32_t AUTH_BACKOFF_TIMEOUT_ID = 2;
 };
 
 }  // namespace esphome::daikin_madoka
